@@ -1,0 +1,5 @@
+{
+    "mdb-debugger.mdbPath.windows": "C:\\Program Files\\Microchip\\MPLABX\\v6.00\\mplab_platform\\bin\\",
+    "mdb-debugger.chip": "PIC32MX470512L",
+    "mdb-debugger.tool": "pickit4"
+}

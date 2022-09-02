@@ -1,0 +1,152 @@
+{
+  "name": "mdb-debugger",
+  "author": {
+    "name": "David Alexander Bjerremose",
+    "email": "dab@davidbjerremose.com",
+    "url": "https://github.com/DaBs"
+  },
+  "displayName": "MDB Debugger",
+  "description": "Microchip MDB debugger extension",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.71.0"
+  },
+  "categories": [
+    "Debuggers"
+  ],
+  "activationEvents": [
+    "onDebug",
+    "onCommand:mdb-debugger.getProgramName"
+  ],
+  "contributes": {
+    "breakpoints": [
+      {
+        "language": "c"
+      }
+    ],
+    "configuration": {
+      "title": "MDB Debugger",
+      "properties": {
+        "mdb-debugger.mdbPath.default": {
+          "type": "string",
+          "editPresentation": "singlelineText",
+          "default": "",
+          "description": "Path to folder where MDB is located (example /opt/mplabx/v6.00/mplab_platform/mplab_ipe/bin/ or C:\\Program Files\\Microchip\\MPLABX\\v6.00\\mplab_platform\\bin\\)"
+        },
+        "mdb-debugger.mdbPath.win32": {
+          "type": "string",
+          "editPresentation": "singlelineText",
+          "default": "",
+          "description": "Path to folder where MDB is located (typical example C:\\Program Files\\Microchip\\MPLABX\\v6.00\\mplab_platform\\bin\\)"
+        },
+        "mdb-debugger.mdbPath.darwin": {
+          "type": "string",
+          "editPresentation": "singlelineText",
+          "default": "",
+          "description": "Path to folder where MDB is located (typical example /Applications/microchip/mplabx/v6.00/mplab_platform/mplab_ipe/bin/)"
+        },
+        "mdb-debugger.chip": {
+          "type": "string",
+          "default": "",
+          "description": "Which chip you are debugging and running this on, e.g. PIC32MX470512L"
+        },
+        "mdb-debugger.tool": {
+          "type": "string",
+          "default": "pickit4",
+          "description": "Hardware tool"
+        },
+        "mdb-debugger.commandTimeout": {
+          "type": "number",
+          "default": 20000,
+          "description": "Timeout before an MDB command will time out, in miliseconds"
+        }
+      }
+    },
+    "debuggers": [
+      {
+        "type": "mdb",
+        "label": "MDB",
+        "program": "./out/adapters/DescriptorAdapter.js",
+        "runtime": "node",
+        "languages": [
+          "c"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "program"
+            ],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Absolute file path to ELF file program to debug",
+                "default": "${workspaceFolder}/${command:AskForProgramName}"
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "description": "Automatically stop after launch.",
+                "default": true
+              },
+              "toolConfiguration": {
+                "type": "array",
+                "description": "Extra configuration for the tool that MDB will use to debug, e.g. \"communication.interfaces jtag\"",
+                "default": []
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "mdb",
+            "request": "launch",
+            "name": "MDB Debug",
+            "program": "${workspaceFolder}/${command:AskForProgramName}",
+            "stopOnEntry": true
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "MDB Debugger: Launch",
+            "description": "A new configuration for launching an MDB debugging session with a given program file",
+            "body": {
+              "type": "mdb",
+              "request": "launch",
+              "name": "${2:MDB Debug}",
+              "program": "^\"\\${workspaceFolder}/${1:Program}\""
+            }
+          }
+        ],
+        "variables": {
+          "AskForProgramName": "extension.mdb-debugger.getProgramName"
+        }
+      }
+    ]
+  },
+  "main": "./out/extension.js",
+  "scripts": {
+    "vscode:prepublish": "yarn run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "yarn run compile && yarn run lint",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js"
+  },
+  "dependencies": {
+    "await-notify": "^1.0.1",
+    "node-pty": "^0.10.1",
+    "vscode-debugadapter": "^1.51.0"
+  },
+  "devDependencies": {
+    "@types/glob": "^7.2.0",
+    "@types/mocha": "^9.1.1",
+    "@types/node": "16.x",
+    "@types/vscode": "^1.71.0",
+    "@typescript-eslint/eslint-plugin": "^5.31.0",
+    "@typescript-eslint/parser": "^5.31.0",
+    "@vscode/test-electron": "^2.1.5",
+    "eslint": "^8.20.0",
+    "glob": "^8.0.3",
+    "mocha": "^10.0.0",
+    "typescript": "^4.7.4"
+  }
+}
