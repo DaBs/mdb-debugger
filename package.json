@@ -134,6 +134,7 @@
   "dependencies": {
     "await-notify": "^1.0.1",
     "node-pty": "^0.10.1",
+    "queue": "^6.0.2",
     "vscode-debugadapter": "^1.51.0"
   },
   "devDependencies": {

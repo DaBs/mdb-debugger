@@ -198,17 +198,17 @@ export class MDBDebuggerSession extends LoggingDebugSession {
 		this.sendResponse(response);
 	}
 
-    protected stackTraceRequest(response: DebugProtocol.StackTraceResponse, args: DebugProtocol.StackTraceArguments): void {
+    protected async stackTraceRequest(response: DebugProtocol.StackTraceResponse, args: DebugProtocol.StackTraceArguments): Promise<void> {
 
 		const startFrame = typeof args.startFrame === 'number' ? args.startFrame : 0;
 		const maxLevels = typeof args.levels === 'number' ? args.levels : 1000;
 		const endFrame = startFrame + maxLevels;
 
-		const stk = this._runtime.stack(startFrame, endFrame);
+		const stk = await this._runtime.stack(startFrame, endFrame);
 
 		response.body = {
-			stackFrames: stk.frames.map((f: MDBStackFrame) => new StackFrame(f.index, f.name, this.createSource(f.file), this.convertDebuggerLineToClient(f.line))),
-			totalFrames: stk.count
+			stackFrames: [],//stk.frames.map((f: MDBStackFrame) => new StackFrame(f.index, f.name, this.createSource(f.file), this.convertDebuggerLineToClient(f.line))),
+			totalFrames: 20,// stk.count
 		};
 		this.sendResponse(response);
 	}
@@ -332,13 +332,14 @@ export class MDBDebuggerSession extends LoggingDebugSession {
 			} else {
 				const matches = /del +([0-9]+)/.exec(args.expression);
 				if (matches && matches.length === 2) {
-					const mbp = this._runtime.clearBreakPoint(this._runtime.sourceFile, this.convertClientLineToDebugger(parseInt(matches[1])));
-					if (mbp) {
-						const bp = <DebugProtocol.Breakpoint> new Breakpoint(false);
-						bp.id= mbp.id;
-						this.sendEvent(new BreakpointEvent('removed', bp));
-						reply = `breakpoint deleted`;
-					}
+					this._runtime.clearBreakPoint(this._runtime.sourceFile, this.convertClientLineToDebugger(parseInt(matches[1])), (mbp) => {
+						if (mbp) {
+							const bp = <DebugProtocol.Breakpoint> new Breakpoint(false);
+							bp.id= mbp.id;
+							this.sendEvent(new BreakpointEvent('removed', bp));
+							reply = `breakpoint deleted`;
+						}
+					});
 				}
 			}
 		}
