@@ -103,12 +103,11 @@ export class MDBRuntime extends EventEmitter {
 
 		await this.executeRawCommand(`Device ${this._mdbConfig.chip}`);
 		await this.executeRawCommand(`Hwtool ${this._mdbConfig.tool}`);
-		await this.executeRawCommand(`Program "${args.program}"`);
-		await this.executeRawCommand('Run');
+		await this.executeAndWait(`Program "${args.program}"`, 'Program succeeded');
 
 		if (args.stopOnEntry) {
 			// we step once
-			this.step(false, 'stopOnEntry');
+			this.step('stopOnEntry');
 		} else {
 			// we just start to run until we hit a breakpoint or an exception
 			this.continue();
@@ -118,31 +117,74 @@ export class MDBRuntime extends EventEmitter {
 	/**
 	 * Continue execution to the end/beginning.
 	 */
-	public continue(reverse = false) {
-		this.run(reverse, undefined);
+	public async continue() {
+		this.addCommandToQueue('Run', 'Running');
+		this.run();
 	}
 
 	/**
 	 * Step to the next/previous non empty line.
 	 */
-	public step(reverse = false, event = 'stopOnStep') {
-		this.run(reverse, event);
+	public async step(event = 'stopOnStep') {
+		this.run(event);
 	}
 
 	/**
-	 * Returns a fake 'stacktrace' where every 'stackframe' is a word from the current line.
+	 * Returns stack trace
 	 */
-	public async stack(startFrame: number, endFrame: number): Promise<void> {
+	public async stack(startFrame: number, endFrame: number): Promise<{ frames: MDBStackFrame[], count: number }> {
 
 		this.eventType = EventType.STACK_FRAMES;
 		this._stdoutBuffer = '';
 		this._stdoutBuffering = true;
 
-		const stdOutPromise = this.waitForStdOut(`#${endFrame}`);
-		const executePromise = this.executeRawCommand(`Backtrace full ${endFrame - startFrame}`);
-		await stdOutPromise;
-		
-		await executePromise;
+		await this.executeAndWait(`Backtrace full ${endFrame - startFrame}`, 'null');
+
+		const collectedBuffer = this._stdoutBuffer;
+		this._stdoutBuffering = false;
+
+		const rawFrames = collectedBuffer.split('\r\n');
+		const parsedFrames: MDBStackFrame[] = rawFrames.map((rawFrameBuffer: string): MDBStackFrame | null => {
+			const matches = rawFrameBuffer.match(/#(\d+)  ([a-zA-z0-9_]+) \(\) at (.+):(\d+)/);
+			if (!matches) return null;
+			const [, index, name, file, line] = matches;
+
+			const stackframe: MDBStackFrame = { 
+				index: parseInt(index, 10), 
+				name, 
+				file, 
+				line: parseInt(line, 10),
+			};
+
+			return stackframe;
+
+		}).filter((frame: MDBStackFrame | null): frame is MDBStackFrame => frame !== null);
+
+		return {
+			frames: parsedFrames,
+			count: parsedFrames.length,
+		};
+	}
+
+	public async evaluate(expression: string, hex = true) {
+		const result = await this.executeAndWait(`Print /a ${expression}`, new RegExp(`the address of ${expression}: (0x[a-zA-Z0-9]+)`, 'i'));
+		const matches = result.match(new RegExp(`the address of ${expression}: (0x[a-zA-Z0-9]+)`, 'i'));
+		if (!matches) return null;
+
+		const [, address] = matches;
+
+		const format = hex ? 'x' : 'd';
+
+		const collectedRawOuputPromise = this.collectFromStdOut((collected) => {
+			return collected.includes('\r\n');
+		})
+
+		await this.executeRawCommand(`x /trn1f${format}ub ${address}`);
+		const collectedRawOutput = (await collectedRawOuputPromise) as string;
+		const data = collectedRawOutput.replace(/[ \r\n]/gm, '');
+
+		const prefix = hex ? '0x' : '';
+		return prefix + data;
 	}
 
 	public getBreakpoints(path: string, line: number): number[] {
@@ -241,34 +283,55 @@ export class MDBRuntime extends EventEmitter {
 		});
 	}
 
-	private addCommandToQueue(command: string, callback?: () => void) {
-		this._commandQueue.push(async (done) => {
-			await this.executeRawCommand(command);
-			if (callback) callback();
-			if (done) done();
+	private addCommandToQueue(command: string, patternOrStringToWait?: RegExp | string | null, callback?: () => void) {
+		this._commandQueue.push((queueCallback) => {
+			const executionPromise = patternOrStringToWait ? this.executeAndWait(command, patternOrStringToWait) : this.executeRawCommand(command);
+			executionPromise.then(() => {
+				if (callback) callback();
+				if (queueCallback) queueCallback(undefined, true);
+			});
 		});
 	}
 
 	private addBreakpointCommand(name: string, line: number, cb?: (status: boolean) => void) {
-		this.addCommandToQueue(`Break "${name}":${line}`, () => cb && cb(true));
+		this.addCommandToQueue(`Break "${name}":${line}`, null, () => cb && cb(true));
 	}
 
 	private removeBreakpointCommand(id: number, cb?: () => void) {
-		this.addCommandToQueue(`Delete ${id}`, cb);
+		this.addCommandToQueue(`Delete ${id}`, null, cb);
 	}
 
 	private removeAllBreakpointsCommand(cb?: () => void) {
-		this.addCommandToQueue('Delete', cb);
+		this.addCommandToQueue('Delete', null, cb);
 	}
 
-	private async executeRawCommand(command: string) {
+	private async executeRawCommand(command: string, skipWaitingForNewline = false) {
 		await this.guardMDBSetup();
 		console.log(`Writing ${command}`);
 		this._mdbThread?.stdin?.write(command + '\n');
-		await this.waitForStdOut('>');
+		if (!skipWaitingForNewline) {
+			await this.waitForStdOut('>');
+		}
 	}
 
-	private waitForStdOut(patternOrString: RegExp | string, timeout: number = 30000) {
+	private async collectFromStdOut(callback: (currentCollected: string) => boolean) {
+		return new Promise(resolve => {
+			let currentCollected = '';
+			const listener = (data: any) => {
+				const dataAsString = data as string;
+				currentCollected += dataAsString;
+				const shouldStop = callback(currentCollected);
+				if (shouldStop) {
+					this._mdbThread?.stdout?.off('data', listener);
+					resolve(currentCollected);
+				}
+			};
+	
+			this._mdbThread?.stdout?.on('data', listener);
+		});
+	}
+
+	private waitForStdOut(patternOrString: RegExp | string, timeout: number = 30000): Promise<string> {
 		return new Promise((resolve, reject) => {
 			let timeLeft = timeout;
 			let intervalId: NodeJS.Timer | null = null;
@@ -306,6 +369,16 @@ export class MDBRuntime extends EventEmitter {
 		});
 	}
 
+	private async executeAndWait(command: string, patternOrString: RegExp | string, skipWaitingForNewline = false, timeout = 30000 ) {
+		const stdOutPromise = this.waitForStdOut(patternOrString, timeout);
+		const executePromise = this.executeRawCommand(command, skipWaitingForNewline);
+		const stdout = await stdOutPromise;
+		
+		await executePromise;
+
+		return stdout;
+	}
+
 	private async guardMDBSetup() {
 		if (!this._mdbThread) {
 			this._mdbThread = spawn(path.resolve(this._mdbConfig.executablePath));
@@ -330,7 +403,7 @@ export class MDBRuntime extends EventEmitter {
 	 * Run through the file.
 	 * If stepEvent is specified only run a single step and emit the stepEvent.
 	 */
-	private run(reverse = false, stepEvent?: string) {
+	private run(stepEvent?: string) {
 		this.process();
 	}
 
@@ -361,7 +434,7 @@ export class MDBRuntime extends EventEmitter {
 
 		if (this._stdoutBuffering) {
 
-			this._stdoutBuffer = message;
+			this._stdoutBuffer += message;
 
 			const matches = this._stdoutBuffer.replace(/\n/gi, '').match(/address:(0x.{8})|file:(.+)|source line:(\d+)/gm);
 			if (matches && matches.length >= 3) {

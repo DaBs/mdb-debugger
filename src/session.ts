@@ -111,6 +111,8 @@ export class MDBDebuggerSession extends LoggingDebugSession {
 		// make VS Code send the breakpointLocations request
 		response.body.supportsBreakpointLocationsRequest = true;
 
+		response.body.supportsDelayedStackTraceLoading = false;
+
 		this.sendResponse(response);
 
 		// since this debug adapter can accept configuration requests like 'setBreakpoint' at any time,
@@ -198,19 +200,19 @@ export class MDBDebuggerSession extends LoggingDebugSession {
 		this.sendResponse(response);
 	}
 
-    protected async stackTraceRequest(response: DebugProtocol.StackTraceResponse, args: DebugProtocol.StackTraceArguments): Promise<void> {
+    protected stackTraceRequest(response: DebugProtocol.StackTraceResponse, args: DebugProtocol.StackTraceArguments): void {
 
 		const startFrame = typeof args.startFrame === 'number' ? args.startFrame : 0;
 		const maxLevels = typeof args.levels === 'number' ? args.levels : 1000;
 		const endFrame = startFrame + maxLevels;
 
-		const stk = await this._runtime.stack(startFrame, endFrame);
-
-		response.body = {
-			stackFrames: [],//stk.frames.map((f: MDBStackFrame) => new StackFrame(f.index, f.name, this.createSource(f.file), this.convertDebuggerLineToClient(f.line))),
-			totalFrames: 20,// stk.count
-		};
-		this.sendResponse(response);
+		this._runtime.stack(startFrame, endFrame).then(stk => {
+			response.body = {
+				stackFrames: stk.frames.map((f: MDBStackFrame) => new StackFrame(f.index, f.name, this.createSource(f.file), this.convertDebuggerLineToClient(f.line))),
+				totalFrames: stk.count
+			};
+			this.sendResponse(response);
+		});
 	}
 
     protected scopesRequest(response: DebugProtocol.ScopesResponse, args: DebugProtocol.ScopesArguments): void {
@@ -228,7 +230,7 @@ export class MDBDebuggerSession extends LoggingDebugSession {
 
 		const variables: DebugProtocol.Variable[] = [];
 
-		if (this._isLongrunning.get(args.variablesReference)) {
+		/*if (this._isLongrunning.get(args.variablesReference)) {
 			// long running
 
 			if (request) {
@@ -293,7 +295,7 @@ export class MDBDebuggerSession extends LoggingDebugSession {
 				});
 				this._isLongrunning.set(ref, true);
 			}
-		}
+		}*/
 
 		response.body = {
 			variables: variables
@@ -307,8 +309,6 @@ export class MDBDebuggerSession extends LoggingDebugSession {
 	}
 
     protected reverseContinueRequest(response: DebugProtocol.ReverseContinueResponse, args: DebugProtocol.ReverseContinueArguments) : void {
-		this._runtime.continue(true);
-		this.sendResponse(response);
  	}
 
      protected nextRequest(response: DebugProtocol.NextResponse, args: DebugProtocol.NextArguments): void {
@@ -316,7 +316,7 @@ export class MDBDebuggerSession extends LoggingDebugSession {
 		this.sendResponse(response);
 	}
 
-    protected evaluateRequest(response: DebugProtocol.EvaluateResponse, args: DebugProtocol.EvaluateArguments): void {
+    protected async evaluateRequest(response: DebugProtocol.EvaluateResponse, args: DebugProtocol.EvaluateArguments): Promise<void> {
 
 		let reply: string | undefined = undefined;
 
@@ -342,6 +342,11 @@ export class MDBDebuggerSession extends LoggingDebugSession {
 					});
 				}
 			}
+		}
+
+		if (args.context === 'hover') {
+			const result = await this._runtime.evaluate(args.expression);
+			reply = result || undefined;
 		}
 
 		response.body = {
