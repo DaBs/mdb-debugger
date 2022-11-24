@@ -133,6 +133,7 @@
   },
   "dependencies": {
     "await-notify": "^1.0.1",
+    "elf-tools": "^1.1.2",
     "node-pty": "^0.10.1",
     "queue": "^6.0.2",
     "vscode-debugadapter": "^1.51.0"

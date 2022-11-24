@@ -174,10 +174,9 @@ export class MDBDebuggerSession extends LoggingDebugSession {
 		if (args.source.path) {
 			const bps = this._runtime.getBreakpoints(args.source.path, this.convertClientLineToDebugger(args.line));
 			response.body = {
-				breakpoints: bps.map((col: number) => {
+				breakpoints: bps.map((bp) => {
 					return {
-						line: args.line,
-						column: this.convertDebuggerColumnToClient(col)
+						line: bp.line,
 					}
 				})
 			};

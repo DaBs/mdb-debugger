@@ -8,6 +8,9 @@ import * as path from 'path';
 import { ChildProcess, spawn } from 'child_process';
 import queue from 'queue';
 import { LaunchRequestArguments } from './session';
+import { ELFFile } from './utils/elf';
+import { convertHexToNumber, convertNumberToHex } from './utils/hex';
+import { normalizePath } from './utils/path';
 
 
 enum EventType {
@@ -43,12 +46,19 @@ export interface MDBRuntimeConfig {
 	timeout: number;
 }
 
+export interface MDBDebugSymbol {
+	name: string;
+	address: number;
+	length: number;
+	info?: string;
+}
+
 /**
  * A Mock runtime with minimal debugger functionality.
  */
 export class MDBRuntime extends EventEmitter {
 
-	private _commandQueue = queue({ results: [] });
+	private _commandQueue = queue({ results: [], concurrency: 1 });
 
 	private _mdbThread: ChildProcess | null = null;
 
@@ -64,11 +74,7 @@ export class MDBRuntime extends EventEmitter {
 		return this._sourceFile;
 	}
 
-	// the contents (= lines) of the one and only file
-	private _sourceLines: string[] = [];
-
-	// This is the next line that will be 'executed'
-	private _currentLine = 0;
+	private _symbols: Record<string, MDBDebugSymbol> = {};
 
 	// maps from sourceFile to array of Mock breakpoints
 	private _breakPoints = new Map<string, MDBBreakpoint[]>();
@@ -89,10 +95,6 @@ export class MDBRuntime extends EventEmitter {
 	 * Start executing the given program.
 	 */
 	public async start(args: LaunchRequestArguments) {
-
-		this.loadSource(args.program);
-		this._currentLine = -1;
-
 		this.verifyBreakpoints(this._sourceFile);
 
 		if (args.toolConfiguration && args.toolConfiguration.length) {
@@ -100,6 +102,8 @@ export class MDBRuntime extends EventEmitter {
 				await this.executeRawCommand(`Set ${toolConfig}\n`);
 			}
 		}
+
+		await this.processElfFile(args.program);
 
 		await this.executeRawCommand(`Device ${this._mdbConfig.chip}`);
 		await this.executeRawCommand(`Hwtool ${this._mdbConfig.tool}`);
@@ -145,7 +149,7 @@ export class MDBRuntime extends EventEmitter {
 
 		const rawFrames = collectedBuffer.split('\r\n');
 		const parsedFrames: MDBStackFrame[] = rawFrames.map((rawFrameBuffer: string): MDBStackFrame | null => {
-			const matches = rawFrameBuffer.match(/#(\d+)  ([a-zA-z0-9_]+) \(\) at (.+):(\d+)/);
+			const matches = rawFrameBuffer.match(/#(\d+)  ([a-zA-z0-9_ ]+) \(\) at (.+):(\d+)/);
 			if (!matches) return null;
 			const [, index, name, file, line] = matches;
 
@@ -167,11 +171,24 @@ export class MDBRuntime extends EventEmitter {
 	}
 
 	public async evaluate(expression: string, hex = true) {
-		const result = await this.executeAndWait(`Print /a ${expression}`, new RegExp(`the address of ${expression}: (0x[a-zA-Z0-9]+)`, 'i'));
-		const matches = result.match(new RegExp(`the address of ${expression}: (0x[a-zA-Z0-9]+)`, 'i'));
-		if (!matches) return null;
 
-		const [, address] = matches;
+		const existingSymbolInformation = this._symbols[expression];
+
+		let address;
+		let length = 1;
+
+		if (!existingSymbolInformation) {
+			const result = await this.executeAndWait(`Print /a ${expression}`, new RegExp(`the address of ${expression}: (0x[a-zA-Z0-9]+)`, 'i'));
+			const matches = result.match(new RegExp(`the address of ${expression}: (0x[a-zA-Z0-9]+)`, 'i'));
+			if (!matches) return null;
+	
+			const [, matchedAddress] = matches;
+			address = convertHexToNumber(matchedAddress);
+		} else {
+			const result = await this.executeAndWait(`Print ${expression}`, /{\n(.+)}/ms);
+			address = existingSymbolInformation.address;
+			length = existingSymbolInformation.length;
+		}
 
 		const format = hex ? 'x' : 'd';
 
@@ -179,7 +196,9 @@ export class MDBRuntime extends EventEmitter {
 			return collected.includes('\r\n');
 		})
 
-		await this.executeRawCommand(`x /trn1f${format}ub ${address}`);
+		const hexAddress = convertNumberToHex(address);
+
+		await this.executeRawCommand(`x /trn${length}f${format}ub ${hexAddress}`);
 		const collectedRawOutput = (await collectedRawOuputPromise) as string;
 		const data = collectedRawOutput.replace(/[ \r\n]/gm, '');
 
@@ -187,40 +206,31 @@ export class MDBRuntime extends EventEmitter {
 		return prefix + data;
 	}
 
-	public getBreakpoints(path: string, line: number): number[] {
+	public getBreakpoints(filePath: string, line: number): MDBBreakpoint[] {
+		const bps = this._breakPoints.get(normalizePath(filePath));
 
-		const l = this._sourceLines[line];
+		if (!bps) return [];
 
-		let sawSpace = true;
-		const bps: number[] = [];
-		for (let i = 0; i < l.length; i++) {
-			if (l[i] !== ' ') {
-				if (sawSpace) {
-					bps.push(i);
-					sawSpace = false;
-				}
-			} else {
-				sawSpace = true;
-			}
-		}
-
-		return bps;
+		const relevantBps = bps.filter(bp => bp.line >= line);
+		return relevantBps;
 	}
 
 	/*
 	 * Set breakpoint in file with given line.
 	 */
-	public setBreakPoint(path: string, line: number) : MDBBreakpoint {
+	public setBreakPoint(filePath: string, line: number) : MDBBreakpoint {
+
+		const resolvedPath = normalizePath(filePath);
 
 		const bp = <MDBBreakpoint> { verified: false, line, id: this._breakpointId++ };
-		let bps = this._breakPoints.get(path);
+		let bps = this._breakPoints.get(resolvedPath);
 		if (!bps) {
 			bps = new Array<MDBBreakpoint>();
-			this._breakPoints.set(path, bps);
+			this._breakPoints.set(resolvedPath, bps);
 		}
 		bps.push(bp);
 
-		this.verifyBreakpoints(path);
+		this.verifyBreakpoints(resolvedPath);
 
 		return bp;
 	}
@@ -228,8 +238,8 @@ export class MDBRuntime extends EventEmitter {
 	/*
 	 * Clear breakpoint in file with given line.
 	 */
-	public clearBreakPoint(path: string, line: number, callback: (breakpoint: MDBBreakpoint | undefined) => void) : void {
-		let bps = this._breakPoints.get(path);
+	public clearBreakPoint(filePath: string, line: number, callback: (breakpoint: MDBBreakpoint | undefined) => void) : void {
+		let bps = this._breakPoints.get(normalizePath(filePath));
 		if (bps) {
 			const index = bps.findIndex(bp => bp.line === line);
 			if (index >= 0) {
@@ -246,14 +256,14 @@ export class MDBRuntime extends EventEmitter {
 	/*
 	 * Clear all breakpoints for file.
 	 */
-	public async clearBreakpoints(path: string, cb?: () => void): Promise<void> {
-		const fileBreakpoints = this._breakPoints.get(path) || [];
+	public async clearBreakpoints(filePath: string, cb?: () => void): Promise<void> {
+		const fileBreakpoints = this._breakPoints.get(normalizePath(filePath)) || [];
 		const promises = [];
 		for (const fileBreakpoint of fileBreakpoints) {
 			promises.push(new Promise(resolve => this.removeBreakpointCommand(fileBreakpoint.id, () => resolve(true))));
 		}
 		await Promise.all(promises);
-		this._breakPoints.delete(path);
+		//this._breakPoints.delete(path);
 		if (cb) cb();
 	}
 
@@ -277,6 +287,22 @@ export class MDBRuntime extends EventEmitter {
 
 	// private methods
 
+	private async processElfFile(elfPath: string): Promise<void> {
+		const elfBytes = readFileSync(path.resolve(elfPath));
+		const elfFile = new ELFFile(elfBytes.buffer);
+		const result = elfFile.load();
+		const symbolTable = elfFile.elfSymbolTables[0];
+
+		for (const symbolTableEntry of symbolTable.symTabEntries) {
+			const name = symbolTableEntry.St_name.description();
+			const address = symbolTableEntry.St_value.Get32BitValue();
+			const length = symbolTableEntry.St_size.value;
+			const bindingType = symbolTableEntry.St_info.description();
+
+			this._symbols[name] = { name, address, length };
+		}
+	}
+
 	private async process() {
 		this._commandQueue.start((err) => {
 
@@ -284,17 +310,17 @@ export class MDBRuntime extends EventEmitter {
 	}
 
 	private addCommandToQueue(command: string, patternOrStringToWait?: RegExp | string | null, callback?: () => void) {
-		this._commandQueue.push((queueCallback) => {
+		this._commandQueue.push(() => {
 			const executionPromise = patternOrStringToWait ? this.executeAndWait(command, patternOrStringToWait) : this.executeRawCommand(command);
-			executionPromise.then(() => {
+			return executionPromise.then(() => {
 				if (callback) callback();
-				if (queueCallback) queueCallback(undefined, true);
+				//if (queueCallback) queueCallback(undefined, true);
 			});
 		});
 	}
 
-	private addBreakpointCommand(name: string, line: number, cb?: (status: boolean) => void) {
-		this.addCommandToQueue(`Break "${name}":${line}`, null, () => cb && cb(true));
+	private async addBreakpointCommand(name: string, line: number, cb?: (status: boolean) => void) {
+		this.addCommandToQueue(`Break ${name}:${line}`, new RegExp(`Breakpoint (\\d+) at file (${name}), line (\\d+)\\.`), () => cb && cb(true));
 	}
 
 	private removeBreakpointCommand(id: number, cb?: () => void) {
@@ -382,6 +408,8 @@ export class MDBRuntime extends EventEmitter {
 	private async guardMDBSetup() {
 		if (!this._mdbThread) {
 			this._mdbThread = spawn(path.resolve(this._mdbConfig.executablePath));
+			this._mdbThread.stdout?.setMaxListeners(Infinity);
+			this._mdbThread.stderr?.setMaxListeners(Infinity);
 			this._mdbThread.stdout?.pipe(process.stdout);
 			this._mdbThread.stderr?.pipe(process.stderr);
 			this._mdbThread.stdout?.on('data', (data: any) => {
@@ -389,13 +417,6 @@ export class MDBRuntime extends EventEmitter {
 				this.parseStdOutMessage(message);
 			});
 			await this.waitForStdOut('>');
-		}
-	}
-
-	private loadSource(file: string) {
-		if (this._sourceFile !== file) {
-			this._sourceFile = file;
-			this._sourceLines = readFileSync(this._sourceFile).toString().split('\n');
 		}
 	}
 
@@ -408,12 +429,10 @@ export class MDBRuntime extends EventEmitter {
 	}
 
 	private async verifyBreakpoints(filePath: string) : Promise<void> {
-		let breakpoints = this._breakPoints.get(filePath);
+		let breakpoints = this._breakPoints.get(normalizePath(filePath));
 		if (breakpoints) {
-			this.loadSource(filePath);
 			for (const breakpoint of breakpoints) {
-				if (!breakpoint.verified && breakpoint.line < this._sourceLines.length) {
-					const srcLine = this._sourceLines[breakpoint.line].trim();
+				if (!breakpoint.verified) {
 					// don't set 'verified' to true if the line contains the word 'lazy'
 					// in this case the breakpoint will be verified 'lazy' after hitting it once.
 					this.addBreakpointCommand(path.basename(filePath), breakpoint.line, () => {
@@ -447,8 +466,20 @@ export class MDBRuntime extends EventEmitter {
 					} else {
 						return [parts[0], parts.slice(2).join(':')];
 					}
-				}).reduce((collector, [key, rawValue]) => {
-					collector[key.replace(/ /gi,'_')] = rawValue;
+				}).reduce((collector, [key, rawValue]): EventData => { // TODO: This collector is garbage and should be refactored with a matching pattern instead..
+					let sanitizedKey = key.replace(/ /gi,'_');
+					let value: string | number = rawValue;
+
+					if (sanitizedKey === 'source_line') {
+						sanitizedKey = 'line';
+						value = parseInt(value, 10);
+					}
+
+					if (sanitizedKey === 'address') {
+						value = convertHexToNumber(value as string);
+					}
+
+					collector[sanitizedKey] = value;
 					return collector;
 				}, {} as EventData);
 				eventData.eventType = this.eventType;
@@ -459,7 +490,7 @@ export class MDBRuntime extends EventEmitter {
 
 	private fireEventsForData(data: EventData) {
 		if (data.eventType === EventType.STOP_AT) {
-			const breakpoints = this._breakPoints.get(data.file || '');
+			const breakpoints = this._breakPoints.get(normalizePath(data.file || ''));
 			if (breakpoints) {
 				const bps = breakpoints.filter(bp => bp.line === data.line);
 				if (bps.length > 0) {
@@ -479,64 +510,6 @@ export class MDBRuntime extends EventEmitter {
 
 			this.sendEvent('stopOnException', data);
 		}
-	}
-
-	/**
-	 * Fire events if line has a breakpoint or the word 'exception' is found.
-	 * Returns true is execution needs to stop.
-	 */
-	private fireEventsForLine(ln: number, stepEvent?: string): boolean {
-
-		const line = this._sourceLines[ln].trim();
-
-		// if 'log(...)' found in source -> send argument to debug console
-		const matches = /log\((.*)\)/.exec(line);
-		if (matches && matches.length === 2) {
-			this.sendEvent('output', matches[1], this._sourceFile, ln, matches.index)
-		}
-
-		// if a word in a line matches a data breakpoint, fire a 'dataBreakpoint' event
-		const words = line.split(" ");
-		for (let word of words) {
-			if (this._breakAddresses.has(word)) {
-				this.sendEvent('stopOnDataBreakpoint');
-				return true;
-			}
-		}
-
-		// if word 'exception' found in source -> throw exception
-		if (line.indexOf('exception') >= 0) {
-			this.sendEvent('stopOnException');
-			return true;
-		}
-
-		// is there a breakpoint?
-		const breakpoints = this._breakPoints.get(this._sourceFile);
-		if (breakpoints) {
-			const bps = breakpoints.filter(bp => bp.line === ln);
-			if (bps.length > 0) {
-
-				// send 'stopped' event
-				this.sendEvent('stopOnBreakpoint');
-
-				// the following shows the use of 'breakpoint' events to update properties of a breakpoint in the UI
-				// if breakpoint is not yet verified, verify it now and send a 'breakpoint' update event
-				if (!bps[0].verified) {
-					bps[0].verified = true;
-					this.sendEvent('breakpointValidated', bps[0]);
-				}
-				return true;
-			}
-		}
-
-		// non-empty line
-		if (stepEvent && line.length > 0) {
-			this.sendEvent(stepEvent);
-			return true;
-		}
-
-		// nothing interesting found -> continue
-		return false;
 	}
 
 	private sendEvent(event: string, ... args: any[]) {
